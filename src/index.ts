@@ -4,6 +4,33 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import snowflake from "snowflake-sdk";
 import { z } from "zod";
+import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const pkg = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8")
+) as { version: string };
+
+// The Snowflake SDK logs at INFO to ./snowflake.log in the CLIENT's working
+// directory by default, silently dropping connection metadata (account, user,
+// host) into whatever repo the MCP client happens to have open. Logging is
+// OFF by default here; set SNOWFLAKE_LOG_LEVEL to re-enable for debugging.
+// Console logging stays off unconditionally: stdout belongs to the MCP
+// protocol and a stray log line would corrupt the stream.
+const SDK_LOG_LEVELS = ["OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"] as const;
+type SdkLogLevel = (typeof SDK_LOG_LEVELS)[number];
+const configureSdkLogging = () => {
+  const requested = (process.env.SNOWFLAKE_LOG_LEVEL || "OFF").toUpperCase();
+  const logLevel = (SDK_LOG_LEVELS as readonly string[]).includes(requested)
+    ? (requested as SdkLogLevel)
+    : "OFF";
+  snowflake.configure({
+    logLevel,
+    logFilePath: join(tmpdir(), "snowflake-mcp.log"),
+    additionalLogToConsole: false,
+  });
+};
 
 interface SnowflakeRow {
   [key: string]: unknown;
@@ -17,15 +44,53 @@ interface QueryResult {
   totalRowCount?: number;
 }
 
+// Readonly defaults ON. This server exists for analysis; anyone who really
+// needs writes must opt in explicitly with SNOWFLAKE_READONLY=false.
 const isReadonlyMode = (): boolean => {
-  return process.env.SNOWFLAKE_READONLY?.toLowerCase() === "true";
+  return process.env.SNOWFLAKE_READONLY?.toLowerCase() !== "false";
 };
 
+// Strip comments before classifying, otherwise "/* cleanup */ DROP TABLE t"
+// or "-- note\nDELETE FROM t" sails straight past an anchored regex.
+const stripSqlComments = (query: string): string => {
+  return query
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/--[^\n]*/g, " ")
+    .replace(/\/\/[^\n]*/g, " ")
+    .trim();
+};
+
+// Blocklist of leading verbs that can mutate state or escalate the session.
+// CALL/EXECUTE/DECLARE/BEGIN can wrap arbitrary SQL; USE/SET can swap role or
+// session state; PUT/GET/REMOVE touch stages. This is defense in depth, not a
+// sandbox -- the real boundary is the Snowflake role the credentials carry.
+const WRITE_STATEMENT =
+  /^\s*(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|UNDROP|CREATE|ALTER|GRANT|REVOKE|COPY|CALL|EXECUTE|USE|SET|UNSET|PUT|GET|REMOVE|COMMENT|BEGIN|COMMIT|ROLLBACK|DECLARE)\b/i;
+
 const isWriteQuery = (query: string): boolean => {
-  const writePatterns = [
-    /^\s*(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|CREATE|ALTER|GRANT|REVOKE|COPY\s+INTO)/i,
-  ];
-  return writePatterns.some((pattern) => pattern.test(query.trim()));
+  return WRITE_STATEMENT.test(stripSqlComments(query));
+};
+
+// Identifiers get interpolated into SQL text (Snowflake has no bind support
+// for identifiers), so anything that is not a plain or double-quoted
+// dotted name is rejected before it reaches a query string.
+const IDENTIFIER =
+  /^(?:[A-Za-z_][\w$]*|"[^"]+")(?:\.(?:[A-Za-z_][\w$]*|"[^"]+")){0,2}$/;
+const validateIdentifier = (name: string, what: string): string => {
+  const trimmed = name.trim();
+  if (!IDENTIFIER.test(trimmed)) {
+    throw new Error(
+      `Invalid ${what} "${name}": expected a plain or double-quoted identifier like MY_DB.MY_SCHEMA.MY_TABLE`
+    );
+  }
+  return trimmed;
+};
+
+const positiveInt = (value: number, what: string, max: number): number => {
+  if (!Number.isInteger(value) || value < 1 || value > max) {
+    throw new Error(`Invalid ${what}: must be an integer between 1 and ${max}`);
+  }
+  return value;
 };
 
 const getEnvOrThrow = (name: string): string => {
@@ -36,9 +101,23 @@ const getEnvOrThrow = (name: string): string => {
   return value;
 };
 
+// When SNOWFLAKE_AUTHENTICATOR is unset, infer it from what credentials are
+// configured. Defaulting to externalbrowser when a PAT is sitting right there
+// was the single most common misconfiguration: a browser window popping on
+// every fresh MCP process.
+const resolveAuthenticator = (): string => {
+  const fromEnv = process.env.SNOWFLAKE_AUTHENTICATOR;
+  if (fromEnv) return fromEnv.toLowerCase();
+  if (process.env.SNOWFLAKE_TOKEN) return "programmatic_access_token";
+  if (process.env.SNOWFLAKE_PRIVATE_KEY || process.env.SNOWFLAKE_PRIVATE_KEY_PATH) {
+    return "snowflake_jwt";
+  }
+  return "externalbrowser";
+};
+
 const createConnection = (): snowflake.Connection => {
-  const authenticator = process.env.SNOWFLAKE_AUTHENTICATOR || "externalbrowser";
-  const authLower = authenticator.toLowerCase();
+  const authenticator = resolveAuthenticator();
+  const authLower = authenticator;
 
   const config: snowflake.ConnectionOptions = {
     account: getEnvOrThrow("SNOWFLAKE_ACCOUNT"),
@@ -84,43 +163,60 @@ const createConnection = (): snowflake.Connection => {
   return snowflake.createConnection(config);
 };
 
-const executeQuery = async (
+const setSessionTimeout = (
   connection: snowflake.Connection,
-  query: string,
-  timeout?: number
-): Promise<SnowflakeRow[]> => {
-  if (timeout) {
-    await new Promise<void>((resolve, reject) => {
-      connection.execute({
-        sqlText: `ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = ${timeout}`,
-        complete: (err) => {
-          if (err) reject(err);
-          else resolve();
-        },
-      });
-    });
-  }
-
-  return new Promise((resolve, reject) => {
+  seconds: number | null
+): Promise<void> => {
+  return new Promise<void>((resolve, reject) => {
     connection.execute({
-      sqlText: query,
-      complete: (err, _stmt, rows) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve((rows as SnowflakeRow[]) || []);
-        }
+      sqlText:
+        seconds === null
+          ? "ALTER SESSION UNSET STATEMENT_TIMEOUT_IN_SECONDS"
+          : `ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = ${seconds}`,
+      complete: (err) => {
+        if (err) reject(err);
+        else resolve();
       },
     });
   });
 };
 
+const executeQuery = async (
+  connection: snowflake.Connection,
+  query: string,
+  timeout?: number
+): Promise<SnowflakeRow[]> => {
+  if (timeout !== undefined) {
+    // Validated before interpolation into the ALTER SESSION statement.
+    await setSessionTimeout(connection, positiveInt(timeout, "timeout", 86400));
+  }
+
+  try {
+    return await new Promise((resolve, reject) => {
+      connection.execute({
+        sqlText: query,
+        complete: (err, _stmt, rows) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve((rows as SnowflakeRow[]) || []);
+          }
+        },
+      });
+    });
+  } finally {
+    if (timeout !== undefined) {
+      // Session-level setting: without this, one call's timeout silently
+      // applies to every later query on the cached connection.
+      await setSessionTimeout(connection, null).catch(() => {});
+    }
+  }
+};
+
 const connectToSnowflake = (
   connection: snowflake.Connection
 ): Promise<snowflake.Connection> => {
-  const authenticator = process.env.SNOWFLAKE_AUTHENTICATOR || "externalbrowser";
-
-  if (authenticator.toLowerCase() === "externalbrowser") {
+  if (resolveAuthenticator() === "externalbrowser") {
     return new Promise((resolve, reject) => {
       connection.connectAsync((err, conn) => {
         if (err) {
@@ -222,14 +318,25 @@ const formatResults = (
 };
 
 const main = async () => {
+  configureSdkLogging();
+
   const server = new McpServer({
     name: "snowflake-mcp",
-    version: "1.1.0",
+    version: pkg.version,
   });
 
   let connection: snowflake.Connection | null = null;
 
   const ensureConnection = async (): Promise<snowflake.Connection> => {
+    if (connection) {
+      // Snowflake sessions idle out and PATs expire. Without this check a
+      // cached dead connection fails every tool call until the MCP client
+      // process is fully restarted.
+      const alive = await connection.isValidAsync().catch(() => false);
+      if (!alive) {
+        connection = null;
+      }
+    }
     if (!connection) {
       connection = createConnection();
       await connectToSnowflake(connection);
@@ -242,6 +349,13 @@ const main = async () => {
     maxRows?: number,
     timeout?: number
   ): Promise<QueryResult> => {
+    // Enforced here, not per-tool, so every code path that reaches Snowflake
+    // passes through the same gate.
+    if (isReadonlyMode() && isWriteQuery(query)) {
+      throw new Error(
+        "Write operations are disabled: the server is running in readonly mode (default). Set SNOWFLAKE_READONLY=false to allow writes."
+      );
+    }
     const conn = await ensureConnection();
     const startTime = Date.now();
     const rows = await executeQuery(conn, query, timeout);
@@ -323,7 +437,7 @@ const main = async () => {
             content: [
               {
                 type: "text" as const,
-                text: "Error: Write operations are disabled. The server is running in readonly mode (SNOWFLAKE_READONLY=true).",
+                text: "Error: Write operations are disabled. The server is running in readonly mode (default). Set SNOWFLAKE_READONLY=false to allow writes.",
               },
             ],
             isError: true,
@@ -443,7 +557,7 @@ const main = async () => {
     async ({ database }) => {
       try {
         const query = database
-          ? `SHOW SCHEMAS IN DATABASE "${database}"`
+          ? `SHOW SCHEMAS IN DATABASE ${validateIdentifier(database, "database")}`
           : "SHOW SCHEMAS";
         const result = await runQuery(query, 1000);
         const schemas = result.rows.map((row) => ({
@@ -490,9 +604,9 @@ const main = async () => {
       try {
         let query = "SHOW TABLES";
         if (database && schema) {
-          query = `SHOW TABLES IN "${database}"."${schema}"`;
+          query = `SHOW TABLES IN ${validateIdentifier(database, "database")}.${validateIdentifier(schema, "schema")}`;
         } else if (schema) {
-          query = `SHOW TABLES IN SCHEMA "${schema}"`;
+          query = `SHOW TABLES IN SCHEMA ${validateIdentifier(schema, "schema")}`;
         }
 
         const result = await runQuery(query, 1000);
@@ -544,9 +658,9 @@ const main = async () => {
       try {
         let query = "SHOW VIEWS";
         if (database && schema) {
-          query = `SHOW VIEWS IN "${database}"."${schema}"`;
+          query = `SHOW VIEWS IN ${validateIdentifier(database, "database")}.${validateIdentifier(schema, "schema")}`;
         } else if (schema) {
-          query = `SHOW VIEWS IN SCHEMA "${schema}"`;
+          query = `SHOW VIEWS IN SCHEMA ${validateIdentifier(schema, "schema")}`;
         }
 
         const result = await runQuery(query, 1000);
@@ -592,7 +706,7 @@ const main = async () => {
     },
     async ({ table }) => {
       try {
-        const result = await runQuery(`DESCRIBE TABLE ${table}`, 1000);
+        const result = await runQuery(`DESCRIBE TABLE ${validateIdentifier(table, "table")}`, 1000);
         const columns = result.rows.map((row) => ({
           name: row.name,
           type: row.type,
@@ -641,7 +755,12 @@ const main = async () => {
     },
     async ({ table, limit }) => {
       try {
-        const result = await runQuery(`SELECT * FROM ${table} LIMIT ${limit}`, limit);
+        const safeTable = validateIdentifier(table, "table");
+        const safeLimit = positiveInt(limit, "limit", 10000);
+        const result = await runQuery(
+          `SELECT * FROM ${safeTable} LIMIT ${safeLimit}`,
+          safeLimit
+        );
         return {
           content: [
             {
@@ -675,7 +794,9 @@ const main = async () => {
     },
     async ({ table }) => {
       try {
-        const result = await runQuery(`SELECT COUNT(*) as row_count FROM ${table}`);
+        const result = await runQuery(
+          `SELECT COUNT(*) as row_count FROM ${validateIdentifier(table, "table")}`
+        );
         const count = result.rows[0]?.ROW_COUNT ?? result.rows[0]?.row_count ?? 0;
         return {
           content: [
@@ -710,7 +831,10 @@ const main = async () => {
     },
     async ({ table }) => {
       try {
-        const result = await runQuery(`SHOW PRIMARY KEYS IN TABLE ${table}`, 100);
+        const result = await runQuery(
+          `SHOW PRIMARY KEYS IN TABLE ${validateIdentifier(table, "table")}`,
+          100
+        );
         if (result.rows.length === 0) {
           return {
             content: [

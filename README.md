@@ -6,6 +6,21 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that enables AI agents to execute SQL queries against Snowflake databases.
 
+> **Fork note.** This is a fork of [`faressoft/snowflake-mcp`](https://github.com/faressoft/snowflake-mcp),
+> which supports SSO (browser) and username/password auth only. This fork adds:
+>
+> - **Programmatic Access Token (PAT)** auth — `SNOWFLAKE_AUTHENTICATOR=programmatic_access_token`
+> - **Key-pair / JWT** auth — `SNOWFLAKE_AUTHENTICATOR=snowflake_jwt`
+> - **OAuth access token** auth — `SNOWFLAKE_AUTHENTICATOR=oauth`
+> - **Secure defaults**: readonly mode ON unless explicitly disabled, hardened
+>   write-statement blocking, identifier validation on all table/schema inputs,
+>   SDK logging off (no stray `snowflake.log` in your working directory), and
+>   automatic reconnect when a cached session goes stale
+>
+> Install from this repo, not from npm: the published `snowflake-mcp` package on npm is
+> upstream's and does **not** include the auth methods above. This fork is versioned `1.2.0+`
+> to keep the two distinguishable.
+
 Users can use natural language to query Snowflake databases, like:
 
 - "Get me the top 10 products by revenue"
@@ -23,12 +38,45 @@ Users can use natural language to query Snowflake databases, like:
 - **Multiple Output Formats**: Table, JSON, or CSV
 - **Query Explanation**: Get execution plans for queries
 - **MCP Prompts**: Guided workflows for common tasks
-- Support for both password and SSO (browser-based) authentication
+- Multiple auth methods: SSO (browser), username/password, programmatic access token (PAT), key-pair/JWT, OAuth token
 - Configurable default warehouse, database, schema, and role
 
 ## Prerequisites
 
 - Node.js 18 or later
+
+## Installation
+
+There is no build step — the compiled server is committed to `dist/`, so it runs straight
+from a clone, an `npx` fetch, or a tarball install.
+
+**Recommended: no install at all.** Point your MCP client at the fork via `npx`
+(all the config examples below do this):
+
+```json
+"command": "npx",
+"args": ["-y", "github:mwilston/snowflake-mcp"]
+```
+
+To pick up fork updates later, clear the npx cache: `rm -rf ~/.npm/_npx`.
+
+**If you want a global `snowflake-mcp` binary**, install from the tarball URL:
+
+```bash
+npm install -g https://github.com/mwilston/snowflake-mcp/archive/refs/heads/master.tar.gz
+```
+
+> **Do not use `npm install -g github:mwilston/snowflake-mcp`.** npm 10 has a bug
+> where a *global* install from a git spec creates a symlink into npm's cache temp
+> directory instead of a real install, leaving a broken or dangling binary. The
+> tarball URL above installs the identical code correctly. (Non-global installs
+> and `npx` are unaffected.)
+
+To work on the server locally:
+
+```bash
+git clone https://github.com/mwilston/snowflake-mcp.git && cd snowflake-mcp && npm install && npm run build && npm link
+```
 
 ## Usage
 
@@ -43,7 +91,7 @@ Add to your Cursor MCP settings (`~/.cursor/mcp.json`):
   "mcpServers": {
     "snowflake": {
       "command": "npx",
-      "args": ["-y", "snowflake-mcp"],
+      "args": ["-y", "github:mwilston/snowflake-mcp"],
       "env": {
         "SNOWFLAKE_ACCOUNT": "your-org-your-account",
         "SNOWFLAKE_USERNAME": "your-username",
@@ -66,7 +114,7 @@ A browser window will open for authentication on first query.
   "mcpServers": {
     "snowflake": {
       "command": "npx",
-      "args": ["-y", "snowflake-mcp"],
+      "args": ["-y", "github:mwilston/snowflake-mcp"],
       "env": {
         "SNOWFLAKE_ACCOUNT": "your-org-your-account",
         "SNOWFLAKE_USERNAME": "your-username",
@@ -82,6 +130,78 @@ A browser window will open for authentication on first query.
 }
 ```
 
+#### Programmatic Access Token (PAT) Authentication
+
+Use this when SSO can't be used (headless environments, CI, shared tooling). Generate the
+token in Snowsight under your user's **Programmatic access tokens**. Requires
+`snowflake-sdk >= 2.4.0`, which handles the `PROGRAMMATIC_ACCESS_TOKEN` authenticator natively.
+
+```json
+{
+  "mcpServers": {
+    "snowflake": {
+      "command": "npx",
+      "args": ["-y", "github:mwilston/snowflake-mcp"],
+      "env": {
+        "SNOWFLAKE_ACCOUNT": "your-org-your-account",
+        "SNOWFLAKE_USERNAME": "your-username",
+        "SNOWFLAKE_AUTHENTICATOR": "programmatic_access_token",
+        "SNOWFLAKE_TOKEN": "your-pat",
+        "SNOWFLAKE_ROLE": "your-role",
+        "SNOWFLAKE_WAREHOUSE": "your-warehouse",
+        "SNOWFLAKE_READONLY": "true"
+      }
+    }
+  }
+}
+```
+
+#### Key-Pair (JWT) Authentication
+
+Set either `SNOWFLAKE_PRIVATE_KEY_PATH` (path to a PEM/PKCS8 file) or `SNOWFLAKE_PRIVATE_KEY`
+(the inline key body). `SNOWFLAKE_PRIVATE_KEY_PASS` is only needed for encrypted keys.
+
+```json
+{
+  "mcpServers": {
+    "snowflake": {
+      "command": "npx",
+      "args": ["-y", "github:mwilston/snowflake-mcp"],
+      "env": {
+        "SNOWFLAKE_ACCOUNT": "your-org-your-account",
+        "SNOWFLAKE_USERNAME": "your-username",
+        "SNOWFLAKE_AUTHENTICATOR": "snowflake_jwt",
+        "SNOWFLAKE_PRIVATE_KEY_PATH": "/absolute/path/to/rsa_key.p8",
+        "SNOWFLAKE_WAREHOUSE": "your-warehouse",
+        "SNOWFLAKE_READONLY": "true"
+      }
+    }
+  }
+}
+```
+
+#### OAuth Token Authentication
+
+For tokens issued by a Snowflake OAuth security integration. For PATs prefer
+`programmatic_access_token` above.
+
+```json
+{
+  "mcpServers": {
+    "snowflake": {
+      "command": "npx",
+      "args": ["-y", "github:mwilston/snowflake-mcp"],
+      "env": {
+        "SNOWFLAKE_ACCOUNT": "your-org-your-account",
+        "SNOWFLAKE_USERNAME": "your-username",
+        "SNOWFLAKE_AUTHENTICATOR": "oauth",
+        "SNOWFLAKE_TOKEN": "your-oauth-access-token"
+      }
+    }
+  }
+}
+```
+
 ### Claude Desktop
 
 Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
@@ -91,7 +211,7 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
   "mcpServers": {
     "snowflake": {
       "command": "npx",
-      "args": ["-y", "snowflake-mcp"],
+      "args": ["-y", "github:mwilston/snowflake-mcp"],
       "env": {
         "SNOWFLAKE_ACCOUNT": "your-org-your-account",
         "SNOWFLAKE_USERNAME": "your-username",
@@ -108,13 +228,18 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 | ------------------------- | ----------- | ----------------- | -------------------------------------------------------------------------- |
 | `SNOWFLAKE_ACCOUNT`       | Yes         | -                 | Your Snowflake account identifier (e.g., `ORG-ACCOUNT`)                    |
 | `SNOWFLAKE_USERNAME`      | Yes         | -                 | Snowflake username                                                         |
-| `SNOWFLAKE_AUTHENTICATOR` | No          | `externalbrowser` | Authentication method: `externalbrowser` (SSO) or `snowflake` (password)   |
+| `SNOWFLAKE_AUTHENTICATOR` | No          | inferred          | `externalbrowser` (SSO), `snowflake` (password), `programmatic_access_token` (PAT), `snowflake_jwt` (key-pair), `oauth`. When unset: PAT if `SNOWFLAKE_TOKEN` is set, key-pair if a private key is set, otherwise `externalbrowser` |
 | `SNOWFLAKE_PASSWORD`      | Conditional | -                 | Required if authenticator is `snowflake`, not needed for `externalbrowser` |
+| `SNOWFLAKE_TOKEN`         | Conditional | -                 | Required if authenticator is `programmatic_access_token` or `oauth`         |
+| `SNOWFLAKE_PRIVATE_KEY_PATH` | Conditional | -              | Path to a PEM/PKCS8 private key; for `snowflake_jwt`                       |
+| `SNOWFLAKE_PRIVATE_KEY`   | Conditional | -                 | Inline private key body; alternative to `SNOWFLAKE_PRIVATE_KEY_PATH`       |
+| `SNOWFLAKE_PRIVATE_KEY_PASS` | No       | -                 | Passphrase for an encrypted private key                                    |
 | `SNOWFLAKE_ROLE`          | No          | -                 | Role to use for the session (uses account default if not set)              |
 | `SNOWFLAKE_WAREHOUSE`     | No          | -                 | Warehouse to use (uses account default if not set)                         |
 | `SNOWFLAKE_DATABASE`      | No          | -                 | Database to use (uses account default if not set)                          |
 | `SNOWFLAKE_SCHEMA`        | No          | -                 | Schema to use (uses account default if not set)                            |
-| `SNOWFLAKE_READONLY`      | No          | `false`           | Set to `true` to block write operations (INSERT, UPDATE, DELETE, etc.)     |
+| `SNOWFLAKE_READONLY`      | No          | `true`            | Readonly is ON by default. Set to `false` to allow write operations        |
+| `SNOWFLAKE_LOG_LEVEL`     | No          | `OFF`             | Snowflake SDK log level (`OFF`, `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`); logs to the OS temp dir, never the working directory |
 
 ### Finding Your Connection Settings
 
@@ -263,8 +388,20 @@ Help build a SQL query based on natural language description.
 
 ## Security Considerations
 
-- **SSO authentication** is recommended for production use as it avoids storing passwords in configuration files
-- **Readonly mode** (`SNOWFLAKE_READONLY=true`) is recommended when you only need to query data
+- **Readonly mode is ON by default.** The server blocks statements starting with
+  write/DDL/session verbs (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`,
+  `CALL`, `EXECUTE`, `USE`, `SET`, `PUT`, `REMOVE`, ...) after stripping SQL comments.
+  Set `SNOWFLAKE_READONLY=false` only if you genuinely need writes.
+- **Readonly mode is defense in depth, not a sandbox.** The real security boundary
+  is the Snowflake role your credentials carry -- use a read-only role (and a
+  dedicated PAT scoped to it) rather than relying on statement filtering.
+- **Table/schema/database arguments are validated as identifiers** before being
+  interpolated into SQL, so tool inputs cannot smuggle extra statements.
+- **SDK logging is off by default** and never writes to the working directory or
+  to stdout (which carries the MCP protocol). Set `SNOWFLAKE_LOG_LEVEL` to debug.
+- **Prefer PAT or key-pair auth for agent use.** SSO (`externalbrowser`) pops a
+  browser window on every fresh MCP process; tokens don't. Keep tokens in your
+  MCP client config in your home directory, never in a repo.
 - Never commit configuration files containing credentials to version control
 - Consider using environment variables or a secrets manager for sensitive values
 - The server executes queries with the permissions of the configured Snowflake user—ensure appropriate access controls are in place

@@ -1,0 +1,26 @@
+name: verify-dist
+
+# dist/ is committed so `npm install -g github:mwilston/snowflake-mcp` needs no
+# build step. This guards the one risk that creates: dist/ drifting from src/.
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npm run build
+      - name: Fail if dist/ is stale
+        run: |
+          if ! git diff --quiet -- dist; then
+            echo "::error::dist/ is out of date with src/. Run 'npm run build' and commit dist/."
+            git diff --stat -- dist
+            exit 1
+          fi
